@@ -221,10 +221,10 @@ def get_fallback_hls_url(videoid: str) -> str:
         )
         res.raise_for_status()
         
-        # 修正: JSONとしてデコードする代わりに、応答テキスト全体をHLS URLとして取得する
+        # 応答テキスト全体をHLS URLとして取得
         hls_url = res.text.strip()
         
-        # 応答が空でないか、または適切なHLSマニフェストURLの形式であることを確認
+        # HLSマニフェストURLの形式であることを確認
         if not hls_url or not hls_url.startswith("https://manifest.googlevideo.com/api/manifest/hls_variant"):
             raise ValueError("Fallback API response is not a valid HLS URL.")
             
@@ -239,8 +239,7 @@ def get_fallback_hls_url(videoid: str) -> str:
 
 def get_360p_single_url(videoid: str) -> str:
     
-    # API URLの変更
-    YTDL_API_URL = f"https://server-thxk.onrender.com/stream/{videoid}"
+    YTDL_API_URL = f"https://ytdlp-cache.vercel.app/dl/{videoid}"
     
     
     try:
@@ -252,7 +251,7 @@ def get_360p_single_url(videoid: str) -> str:
         res.raise_for_status()
         data = res.json()
         
-        formats: List[Dict[str, Any]] = data.get("formats", [])
+        formats: List[Dict[str, Any]] = data.get("res_data", {}).get("formats", [])
         if not formats:
             
             raise ValueError("External API response is missing video formats.")
@@ -261,24 +260,26 @@ def get_360p_single_url(videoid: str) -> str:
         # itag 18 (360p, 音声付き, mp4)を探す
         target_format = next((
             f for f in formats 
-            if f.get("itag") == "18" and 
-               f.get("audioIncluded") is True and
-               f.get("videoUrl") # URLが存在することを確認
+            if str(f.get("itag")) == "18" and # itagを文字列として比較
+               f.get("vcodec") != "none" and 
+               f.get("acodec") != "none" and
+               f.get("url") # URLが存在することを確認
         ), None)
         
         if not target_format:
             
-            # itag 18が見つからない場合は、360pでaudioIncluded: trueのストリームを探す
+            # itag 18が見つからない場合は、360pでaudio/video codecが存在するストリームを探す
             target_format = next((
                 f for f in formats 
-                if f.get("qualityLabel") == "360p" and 
-                   f.get("audioIncluded") is True and
-                   f.get("videoUrl")
+                if "360p" in f.get("quality", "") and 
+                   f.get("vcodec") != "none" and 
+                   f.get("acodec") != "none" and
+                   f.get("url")
             ), None)
 
-        if target_format and target_format.get("videoUrl"):
+        if target_format and target_format.get("url"):
             
-            return target_format["videoUrl"]
+            return target_format["url"]
             
         
         raise ValueError("Could not find a single 360p stream with audio (itag 18 or similar) in the main API response.")
@@ -302,8 +303,7 @@ def get_360p_single_url(videoid: str) -> str:
 
 def fetch_high_quality_streams(videoid: str) -> dict:
     
-    # API URLの変更
-    YTDL_API_URL = f"https://server-thxk.onrender.com/stream/{videoid}"
+    YTDL_API_URL = f"https://ytdlp-cache.vercel.app/dl/{videoid}"
     
     try:
         res = requests.get(
@@ -314,60 +314,64 @@ def fetch_high_quality_streams(videoid: str) -> dict:
         res.raise_for_status()
         data = res.json()
         
-        formats: List[Dict[str, Any]] = data.get("formats", [])
+        formats = data.get("res_data", {}).get("formats", [])
         if not formats:
             raise ValueError("External API response is missing video formats.")
-        
-        
-        # --- 1. 映像専用ストリームの選択 ---
-        video_only_formats = [
-            f for f in formats 
-            if f.get("audioIncluded") is False and 
-               f.get("resolution") not in (None, "0p") and
-               f.get("videoUrl") # URLが存在することを確認
-        ]
-        
-        # 最高の動画ストリームを探す
-        def get_resolution_score(f):
-            # resolutionを '1920p' -> 1920 に変換してスコアリング
-            res_str = f.get("resolution", "0p").replace("p", "")
+            
+        def get_video_quality_score(f):
+            
+            quality_str = f.get("quality", "0").lower().replace("p", "").replace("p60", "60").replace("p30", "30").replace("high", "0")
             try:
-                return int(res_str)
+                
+                if "60" in quality_str:
+                    return int(quality_str.replace("60", "")) * 100 + 60
+                else:
+                    return int(quality_str) * 100 + 30
             except ValueError:
                 return 0
             
-        video_only_formats.sort(key=get_resolution_score, reverse=True)
+        
+        # --- 1. 映像専用ストリームの選択 ---
+        # acodec="none"かつvcodec!="none"かつURLが存在するものをフィルタリング
+        video_formats = [f for f in formats if f.get("acodec") == "none" and f.get("vcodec") != "none" and f.get("url")]
+        video_formats.sort(key=get_video_quality_score, reverse=True)
         
         high_quality_video_url = None
-        if video_only_formats:
-            high_quality_video_url = video_only_formats[0]["videoUrl"]
+        
+        # 最もスコアの高い映像ストリームを選択
+        if video_formats:
+            high_quality_video_url = video_formats[0]["url"]
             
         
         
-        # --- 2. 音声専用ストリームの選択 ---
-        audio_only_formats_all = [
+        # --- 2. 音声専用ストリームの選択 (itagベースの安定した選択) ---
+        # vcodec="none"かつacodec!="none"かつURLが存在するものをフィルタリング
+        audio_only_formats = [
             f for f in formats 
-            if f.get("audioIncluded") is False and 
-               f.get("videoUrl") # URLが存在することを確認
+            if f.get("vcodec") == "none" and 
+               f.get("acodec") != "none" and 
+               f.get("url")
         ]
         
         high_quality_audio_url = None
-        # itagとフォーマットのマップを作成
-        audio_formats_map = {f.get("itag"): f for f in audio_only_formats_all if f.get("itag")}
+        
+        # itagとフォーマットのマップを作成 (itagを文字列に変換してキーとする)
+        audio_formats_map = {str(f.get("itag")): f for f in audio_only_formats if f.get("itag")}
 
-        # 優先順位: 140 (M4A/AAC) -> 251 (Opus高) -> 250 (Opus中) -> 249 (Opus低) -> その他
-        if "140" in audio_formats_map:
-            high_quality_audio_url = audio_formats_map["140"]["videoUrl"]
-        elif "251" in audio_formats_map:
-            high_quality_audio_url = audio_formats_map["251"]["videoUrl"]
-        elif "250" in audio_formats_map:
-            high_quality_audio_url = audio_formats_map["250"]["videoUrl"]
-        elif "249" in audio_formats_map:
-            high_quality_audio_url = audio_formats_map["249"]["videoUrl"]
-        # それでも見つからない場合は、その他の最初の音声ストリームを使用 (フォールバック)
-        elif audio_only_formats_all:
-            high_quality_audio_url = audio_only_formats_all[0]["videoUrl"]
-
+        # 優先順位: 140 (M4A/AAC) -> 251 (Opus高) -> 250 (Opus中) -> 249 (Opus低)
+        audio_priority_itags = ["140", "251", "250", "249"]
+        
+        for itag in audio_priority_itags:
+            if itag in audio_formats_map:
+                high_quality_audio_url = audio_formats_map[itag]["url"]
+                break
+        
+        # それでも見つからない場合は、最もファイルサイズの大きい音声ストリームを使用 (フォールバック)
+        if not high_quality_audio_url and audio_only_formats:
+            # filesizはAPIによって文字列またはNoneの場合があるため、ソートキーで安全に処理
+            audio_only_formats.sort(key=lambda x: int(x.get("filesize", 0) or 0), reverse=True)
+            high_quality_audio_url = audio_only_formats[0]["url"] if audio_only_formats else None
+            
         
         if not high_quality_video_url or not high_quality_audio_url:
             # どちらかが見つからない場合、エラーを発生させる
@@ -384,26 +388,14 @@ def fetch_high_quality_streams(videoid: str) -> dict:
         return {
             "video_url": high_quality_video_url, 
             "audio_url": high_quality_audio_url,
-            "title": data.get("title", "Video") 
+            "title": data.get("res_data", {}).get("title", "Video")
         }
 
     except requests.exceptions.HTTPError as e:
         raise APITimeoutError(f"External stream API returned HTTP error: {e.response.status_code}") from e
     except (requests.exceptions.RequestException, ValueError, json.JSONDecodeError) as e:
-        # APITimeoutErrorにラップして上位に返す
-        raise APITimeoutError(f"Error processing external stream API response: {e}") from e    
-    
-    return [[
-        {"type":"video", "title": i.get("title", failed), "id": i.get("videoId", failed), "author": t.get("author", failed), "published": i.get("publishedText", failed), "view_count_text": i.get('viewCountText', failed), "length_str": str(datetime.timedelta(seconds=i.get("lengthSeconds", 0)))}
-        for i in latest_videos
-    ], {
-        "channel_name": t.get("author", "チャンネル情報取得失敗"), 
-        "channel_icon": author_icon_url, 
-        "channel_profile": t.get("descriptionHtml", "このチャンネルのプロフィール情報は見つかりませんでした。"),
-        "author_banner": author_banner_url,
-        "subscribers_count": t.get("subCount", failed), 
-        "tags": t.get("tags", [])
-    }]
+        raise APITimeoutError(f"Error processing external stream API response: {e}") from e
+
 
 async def getPlaylistData(listid, page):
     t_text = await run_in_threadpool(requestAPI, f"/playlists/{urllib.parse.quote(listid)}?page={urllib.parse.quote(str(page))}", invidious_api.playlist)
