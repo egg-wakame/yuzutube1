@@ -208,31 +208,6 @@ async def getChannelData(channelid):
     author_banners = t.get('authorBanners', [])
     if author_banners and author_banners[0].get("url"):
         author_banner_url = urllib.parse.quote(author_banners[0]["url"], safe="-_.~/:")
-    
-    
-    return [[
-        {"type":"video", "title": i.get("title", failed), "id": i.get("videoId", failed), "author": t.get("author", failed), "published": i.get("publishedText", failed), "view_count_text": i.get('viewCountText', failed), "length_str": str(datetime.timedelta(seconds=i.get("lengthSeconds", 0)))}
-        for i in latest_videos
-    ], {
-        "channel_name": t.get("author", "チャンネル情報取得失敗"), 
-        "channel_icon": author_icon_url, 
-        "channel_profile": t.get("descriptionHtml", "このチャンネルのプロフィール情報は見つかりませんでした。"),
-        "author_banner": author_banner_url,
-        "subscribers_count": t.get("subCount", failed), 
-        "tags": t.get("tags", [])
-    }]
-
-async def getPlaylistData(listid, page):
-    t_text = await run_in_threadpool(requestAPI, f"/playlists/{urllib.parse.quote(listid)}?page={urllib.parse.quote(str(page))}", invidious_api.playlist)
-    t = json.loads(t_text)["videos"]
-    return [{"title": i["title"], "id": i["videoId"], "authorId": i["authorId"], "author": i["author"], "type": "video"} for i in t]
-
-async def getCommentsData(videoid):
-    t_text = await run_in_threadpool(requestAPI, f"/comments/{urllib.parse.quote(videoid)}", invidious_api.comments)
-    t = json.loads(t_text)["comments"]
-    return [{"author": i["author"], "authoricon": i["authorThumbnails"][-1]["url"], "authorid": i["authorId"], "body": i["contentHtml"].replace("\n", "<br>")} for i in t]
-
-# HLSフォールバックURLを取得する関数は変更なし
 def get_fallback_hls_url(videoid: str) -> str:
     
     FALLBACK_API_URL = f"https://test-live-tau.vercel.app/get/url/{videoid}"
@@ -287,7 +262,8 @@ def get_360p_single_url(videoid: str) -> str:
         target_format = next((
             f for f in formats 
             if f.get("itag") == "18" and 
-               f.get("audioIncluded") is True
+               f.get("audioIncluded") is True and
+               f.get("videoUrl") # URLが存在することを確認
         ), None)
         
         if not target_format:
@@ -296,7 +272,8 @@ def get_360p_single_url(videoid: str) -> str:
             target_format = next((
                 f for f in formats 
                 if f.get("qualityLabel") == "360p" and 
-                   f.get("audioIncluded") is True
+                   f.get("audioIncluded") is True and
+                   f.get("videoUrl")
             ), None)
 
         if target_format and target_format.get("videoUrl"):
@@ -341,16 +318,13 @@ def fetch_high_quality_streams(videoid: str) -> dict:
         if not formats:
             raise ValueError("External API response is missing video formats.")
         
-        # 許可される動画のitagを定義（高画質順に並べる）
-        # '399', '299', '248', '137', '247', '398', '397', '396', '395', '136', '135', '134', '133', '160'
-        # 新しいAPIにはqualityLabel/resolutionがあるため、そちらを優先する
-            
         
-        # 映像専用ストリームのフィルタリング
+        # --- 1. 映像専用ストリームの選択 ---
         video_only_formats = [
             f for f in formats 
             if f.get("audioIncluded") is False and 
-               f.get("resolution") not in (None, "0p") 
+               f.get("resolution") not in (None, "0p") and
+               f.get("videoUrl") # URLが存在することを確認
         ]
         
         # 最高の動画ストリームを探す
@@ -370,38 +344,42 @@ def fetch_high_quality_streams(videoid: str) -> dict:
             
         
         
-        # 音声専用ストリームのフィルタリング (audioIncluded: false)
-        audio_only_formats = [
+        # --- 2. 音声専用ストリームの選択 ---
+        audio_only_formats_all = [
             f for f in formats 
             if f.get("audioIncluded") is False and 
-               f.get("container") == "m4a"
+               f.get("videoUrl") # URLが存在することを確認
         ]
         
         high_quality_audio_url = None
-        
-        # 1. itag 140 (AAC/m4a) を優先
-        target_140 = next((f for f in audio_only_formats if f.get("itag") == "140"), None)
-        
-        if target_140:
-            high_quality_audio_url = target_140["videoUrl"] # 新しいAPIでは動画・音声問わず"videoUrl"
-        elif audio_only_formats:
-            # 2. 他の m4a ストリームを品質（不明な場合はリストの最初のもの）で選択
-            high_quality_audio_url = audio_only_formats[0]["videoUrl"]
-        else:
-            # 3. m4a が見つからない場合、他の音声専用ストリームを探す (例: webm/opus)
-            other_audio_only_formats = [
-                f for f in formats 
-                if f.get("audioIncluded") is False and 
-                   f.get("container") in ("webm", "opus")
-            ]
-            if other_audio_only_formats:
-                # itag 251, 250, 249
-                # 一般的に251が最高品質のOpusだが、ここでは最初のものを採用
-                high_quality_audio_url = other_audio_only_formats[0]["videoUrl"]
+        # itagとフォーマットのマップを作成
+        audio_formats_map = {f.get("itag"): f for f in audio_only_formats_all if f.get("itag")}
+
+        # 優先順位: 140 (M4A/AAC) -> 251 (Opus高) -> 250 (Opus中) -> 249 (Opus低) -> その他
+        if "140" in audio_formats_map:
+            high_quality_audio_url = audio_formats_map["140"]["videoUrl"]
+        elif "251" in audio_formats_map:
+            high_quality_audio_url = audio_formats_map["251"]["videoUrl"]
+        elif "250" in audio_formats_map:
+            high_quality_audio_url = audio_formats_map["250"]["videoUrl"]
+        elif "249" in audio_formats_map:
+            high_quality_audio_url = audio_formats_map["249"]["videoUrl"]
+        # それでも見つからない場合は、その他の最初の音声ストリームを使用 (フォールバック)
+        elif audio_only_formats_all:
+            high_quality_audio_url = audio_only_formats_all[0]["videoUrl"]
 
         
         if not high_quality_video_url or not high_quality_audio_url:
-            raise ValueError("Could not find both high-quality video and audio streams.")
+            # どちらかが見つからない場合、エラーを発生させる
+            missing = []
+            if not high_quality_video_url:
+                missing.append("Video Stream")
+            if not high_quality_audio_url:
+                missing.append("Audio Stream")
+            
+            error_detail = f"Missing components: {', '.join(missing)}. Available formats: {len(formats)}"
+            
+            raise ValueError(f"Could not find both high-quality video and audio streams. ({error_detail})")
             
         return {
             "video_url": high_quality_video_url, 
@@ -412,7 +390,32 @@ def fetch_high_quality_streams(videoid: str) -> dict:
     except requests.exceptions.HTTPError as e:
         raise APITimeoutError(f"External stream API returned HTTP error: {e.response.status_code}") from e
     except (requests.exceptions.RequestException, ValueError, json.JSONDecodeError) as e:
-        raise APITimeoutError(f"Error processing external stream API response: {e}") from e
+        # APITimeoutErrorにラップして上位に返す
+        raise APITimeoutError(f"Error processing external stream API response: {e}") from e    
+    
+    return [[
+        {"type":"video", "title": i.get("title", failed), "id": i.get("videoId", failed), "author": t.get("author", failed), "published": i.get("publishedText", failed), "view_count_text": i.get('viewCountText', failed), "length_str": str(datetime.timedelta(seconds=i.get("lengthSeconds", 0)))}
+        for i in latest_videos
+    ], {
+        "channel_name": t.get("author", "チャンネル情報取得失敗"), 
+        "channel_icon": author_icon_url, 
+        "channel_profile": t.get("descriptionHtml", "このチャンネルのプロフィール情報は見つかりませんでした。"),
+        "author_banner": author_banner_url,
+        "subscribers_count": t.get("subCount", failed), 
+        "tags": t.get("tags", [])
+    }]
+
+async def getPlaylistData(listid, page):
+    t_text = await run_in_threadpool(requestAPI, f"/playlists/{urllib.parse.quote(listid)}?page={urllib.parse.quote(str(page))}", invidious_api.playlist)
+    t = json.loads(t_text)["videos"]
+    return [{"title": i["title"], "id": i["videoId"], "authorId": i["authorId"], "author": i["author"], "type": "video"} for i in t]
+
+async def getCommentsData(videoid):
+    t_text = await run_in_threadpool(requestAPI, f"/comments/{urllib.parse.quote(videoid)}", invidious_api.comments)
+    t = json.loads(t_text)["comments"]
+    return [{"author": i["author"], "authoricon": i["authorThumbnails"][-1]["url"], "authorid": i["authorId"], "body": i["contentHtml"].replace("\n", "<br>")} for i in t]
+
+# HLSフォールバックURLを取得する関数は変更なし
         
 async def fetch_embed_url_from_external_api(videoid: str) -> str:
     
