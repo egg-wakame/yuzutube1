@@ -209,6 +209,9 @@
         let lastFetchedCount = 0; 
         const REFRESH_INTERVAL = 5000; 
         
+        const POST_COOLDOWN_MS = 5000; // 5秒のクールダウン
+        let lastPostTime = 0;
+        
         function escapeHTML(str) {
             if (typeof str !== 'string') return str;
             return str.replace(/[&<>"']/g, function(match) {
@@ -330,6 +333,20 @@
                 alert("本文を入力してください。");
                 return;
             }
+            
+            // 文字数制限のチェック
+            if (body.length > 200) {
+                alert(`本文は200文字以下にしてください。現在 ${body.length} 文字です。`);
+                return;
+            }
+            
+            // 連投防止のチェック
+            const now = Date.now();
+            if (now - lastPostTime < POST_COOLDOWN_MS) {
+                const remainingSeconds = ((lastPostTime + POST_COOLDOWN_MS - now) / 1000).toFixed(1);
+                return;
+            }
+
 
             submitButton.disabled = true;
             submitButton.textContent = '送信中...';
@@ -350,11 +367,15 @@
 
                 
                 
+                bodyInput.value = '';
 
+                lastPostTime = Date.now(); // 投稿成功時に時間を更新
+                
                 await fetchPosts(true);
 
             } catch (error) {
                 console.error("投稿処理エラー:", error);
+                alert(`投稿に失敗しました: ${error.message}`); // 失敗した場合もユーザーに通知
                 
             } finally {
                 submitButton.disabled = false;
